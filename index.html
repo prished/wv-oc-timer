@@ -133,7 +133,7 @@
   .sess-actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
   .sess-actions button{flex:1;min-width:0}
   .sess-card.hero .btn-ghost{background:rgba(255,255,255,.12);color:#fff;border-color:rgba(255,255,255,.35)}
-  .sess-row{display:flex;align-items:center;gap:12px;padding:11px 14px;background:none;border:none;border-top:1px solid var(--line);text-align:left;width:100%}
+  .sess-row{display:flex;align-items:center;gap:12px;padding:11px 14px;background:none;border:none;border-top:1px solid var(--line);text-align:left;width:100%;cursor:pointer}
   .sess-row:first-child{border-top:none}
   .sess-row .dt{font-family:var(--mono);font-size:13px;color:var(--ink);flex-shrink:0}
   .sess-row .name{font-weight:600;font-size:14.5px;color:var(--ink)}
@@ -202,6 +202,7 @@
   .shift-editor .sh-row{display:flex;gap:8px;align-items:center;margin-bottom:6px}
   .shift-editor .sh-row .t{font-family:var(--mono);font-size:12.5px;width:52px;color:var(--ink)}
   .shift-editor .sh-row .nm{flex:1;font-size:13.5px;color:var(--ink)}
+  .rm{background:none;border:none;color:#AFC0C4;padding:4px;flex-shrink:0}
   .shift-editor .sh-row .rm{background:none;border:none;color:#AFC0C4;padding:2px 4px}
   .shift-editor .addsh{background:none;border:1.5px dashed var(--line);color:var(--teal);border-radius:8px;padding:7px 10px;font-family:var(--cond);font-weight:700;font-size:12px;letter-spacing:.08em;text-transform:uppercase;margin-top:4px}
 </style>
@@ -442,10 +443,54 @@ function fmtDateFull(iso){
 }
 
 /* current session helpers */
-function currentSession(){ const id=state.reviewSessionId||state.currentSessionId; return state.sessions.find(s=>s.id===id); }
+function currentSession(){ const id=state.reviewSessionId||state.currentSessionId; return state.sessions.find(s=>s.id===id) || state.sessions[0]; }
 function isReview(){ return !!state.reviewSessionId; }
 const paddlersOf = ()=>currentSession().paddlers;
 const shiftsOf = ()=>currentSession().shifts;
+
+/* ---- shared session library: keep every phone showing the same data ----
+   When Firebase is configured, the club's session list lives in the cloud and
+   every phone subscribes to it. Local edits are pushed up; remote changes flow
+   back down and re-render. Without Firebase, this all no-ops and the app runs
+   on the in-memory seed data exactly as before. */
+let sessionsBooted = false;
+function bootSessionSync(){
+  if(sessionsBooted) return;
+  if(!Sync.init()) return;               // no Firebase config → stay local-only
+  sessionsBooted = true;
+  const started = Sync.watchAllSessions(remote=>{
+    if(remote.length===0 && !state._seededRemote){
+      /* First run against an empty cloud: push the current (non-demo) session up
+         so the club has a starting point. Seed demo history stays local only. */
+      state._seededRemote = true;
+      const cur = state.sessions.find(s=>s.id===state.currentSessionId);
+      if(cur && !isDemoSeed(cur.id)) Sync.saveSession(cur);
+      return;
+    }
+    /* Merge remote into state: remote is the source of truth for shared
+       sessions; keep any local-only sessions (demo seeds, joiner copies). */
+    const localOnly = state.sessions.filter(s=>isLocalOnlySession(s.id) && !remote.find(r=>r.id===s.id));
+    remote.sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0));
+    state.sessions = [...remote, ...localOnly];
+    if(!state.sessions.find(s=>s.id===state.currentSessionId)){
+      state.currentSessionId = (remote[0]||state.sessions[0]).id;
+    }
+    render(); updateHeader();
+  });
+}
+function isDemoSeed(id){ return id==="today" || id==="apr18" || id==="mar21"; }
+function isLocalOnlySession(id){ return isDemoSeed(id) || String(id).startsWith("join-"); }
+/* Call after any local mutation to a session so other phones see it.
+   Joiner phones (join-*) don't write to the club library — the coordinator's
+   copy is the authoritative one, and live results flow via the events feed. */
+function persistSession(s){ if(s && !isLocalOnlySession(s.id)) Sync.saveSession(s); }
+/* Debounced variant for rapid-fire changes (live timing). */
+let _persistTimer=null;
+function persistSessionSoon(s){
+  if(!s || isLocalOnlySession(s.id)) return;
+  clearTimeout(_persistTimer);
+  _persistTimer=setTimeout(()=>Sync.saveSession(s), 800);
+}
 
 const ICONS={
   users:'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
@@ -554,6 +599,7 @@ function hostSync(){
   const btn=$("#host-btn");
   btn.disabled=true; btn.textContent="Starting…";
   currentSession().status="active";
+  persistSession(currentSession());
   setTimeout(()=>{ $("#launch").style.display="none"; state.tab="start"; render(); updateHeader(); startLiveWatchers(); },300);
 }
 function joinSync(){
@@ -570,6 +616,17 @@ function joinSync(){
       state.sessionCode = code;
       markOk("jk1");
       markOk("jk2","jk2off","clock ready");
+      /* make sure we have a live (non-demo) session to receive into */
+      if(isDemoSeed(state.currentSessionId)){
+        const joinId = "join-"+code;
+        if(!state.sessions.find(x=>x.id===joinId)){
+          state.sessions.unshift({ id:joinId, name:"Session "+code, date:new Date().toISOString().slice(0,10), distance:"330 m", status:"active", paddlers:[], shifts:{} });
+        }
+        state.currentSessionId = joinId;
+        state.reviewSessionId = null;
+      } else {
+        currentSession().status = "active";
+      }
       Sync.watchRoster(roster=>{
         const list = Object.values(roster||{});
         if(!list.length) return;
@@ -610,7 +667,7 @@ function startLiveWatchers(){
         if(state.role==="finish") state.lastFinish={name:p.name, elapsed:p.finishTs-p.startTs};
       }
     });
-    if(changed) render();
+    if(changed){ render(); persistSessionSoon(s); }
   });
 }
 
@@ -630,6 +687,7 @@ function startArmed(){
   p.status="water"; p.startTs=Date.now(); state.armed=null;
   render(); toast("▶ "+esc(p.name)+" started · "+fmtClockMs(p.startTs));
   if(state.sessionCode) Sync.pushStart(p.id, state.role);
+  persistSessionSoon(currentSession());
 }
 function finishPaddler(id){
   if(isReview()) return;
@@ -638,6 +696,7 @@ function finishPaddler(id){
   state.lastFinish = {name:p.name, elapsed:p.finishTs-p.startTs};
   render(); toast("⏱ "+esc(p.name)+" — "+fmtElapsed(p.finishTs-p.startTs));
   if(state.sessionCode) Sync.pushFinish(p.id, state.role);
+  persistSessionSoon(currentSession());
 }
 function cancelRun(id){
   if(isReview()) return;
@@ -649,7 +708,9 @@ function cancelRun(id){
 }
 function redoRun(id){
   if(isReview()) return;
-  const p=byId(id); p.status="queued"; p.startTs=null; p.finishTs=null;
+  const p=byId(id); if(!p) return;
+  if(!confirm(`Reset ${p.name}'s result? Their finish time will be cleared so they can re-run.\n\nReset`)) return;
+  p.status="queued"; p.startTs=null; p.finishTs=null;
   render(); toast(esc(p.name)+" reset for re-run");
   if(state.sessionCode){ Sync.pushCancelStart(p.id); Sync.pushCancelFinish(p.id); }
 }
@@ -786,16 +847,16 @@ function paddlerRosterRowHTML(p){
 /* ---- SESSION tab: coordinator's home ---- */
 function viewSession(){
   const s=currentSession();
-  const today = state.sessions.find(x=>x.id==="today");
-  const others = state.sessions.filter(x=>x.id!==today.id);
+  const active = isReview() ? state.sessions.find(x=>x.id===state.currentSessionId) : s;
+  const others = state.sessions.filter(x=>x.id!==active.id);
   const done = paddlersOf().filter(p=>p.status==="done").length;
   const onWater = paddlersOf().filter(p=>p.status==="water").length;
   const total = paddlersOf().length;
 
   const heroActions = isReview()
-    ? `<button class="btn-ghost" onclick="exitReview()">${icon("chev",14)} Back to today</button>
+    ? `<button class="btn-ghost" onclick="exitReview()">${icon("chev",14)} Back to current</button>
        <button class="btn-ghost" onclick="openExport()">${icon("download",14)} Export CSV</button>`
-    : today.status==="draft"
+    : active.status==="draft"
       ? `<button class="btn-ghost" onclick="openHostSyncFromCoordinator()">Run morning sync</button>
          <button class="btn-ghost" onclick="openShiftsEditor()">Volunteer shifts</button>`
       : `<button class="btn-ghost" onclick="openExport()">${icon("download",14)} Export CSV</button>
@@ -803,11 +864,11 @@ function viewSession(){
 
   const statusText = isReview()
     ? "Complete · viewing archive"
-    : today.status==="draft" ? "Needs morning sync"
-    : today.status==="active" ? `${done} of ${total} finished`
+    : active.status==="draft" ? "Needs morning sync"
+    : active.status==="active" ? `${done} of ${total} finished`
     : "Complete";
 
-  const liveStrip = (!isReview() && today.status==="active") ? `
+  const liveStrip = (!isReview() && active.status==="active") ? `
     <div style="display:flex;gap:0;margin-top:12px;border-top:1px solid rgba(255,255,255,.25);padding-top:12px">
       <div style="flex:1;text-align:center">
         <div style="font-family:var(--cond);font-weight:700;font-size:22px">${onWater}</div>
@@ -833,17 +894,28 @@ function viewSession(){
     ${isReview()?"":`<div class="label" style="margin:6px 2px 8px">Past sessions</div>
     <div class="list" style="margin-bottom:12px">
       ${others.map(o=>`
-        <button class="sess-row" onclick="openReview('${o.id}')">
+        <div class="sess-row" onclick="openReview('${o.id}')">
           <div class="dt">${fmtDate(o.date)}</div>
           <div class="grow">
             <div class="name">${esc(o.name)}</div>
             <div class="sub">${o.paddlers.length} paddlers · ${o.status==="complete"?"complete":"draft"}</div>
           </div>
           <div class="chev">${icon("chev",16)}</div>
-        </button>`).join("")}
+          <button class="rm" title="Delete session" onclick="event.stopPropagation();deleteSession('${o.id}')">${icon("x",15)}</button>
+        </div>`).join("")}
     </div>
-    <button class="btn-solid" onclick="openNewSession()">${icon("plus",16)} New test session</button>`}
+    <button class="btn-solid" onclick="openNewSession()">${icon("plus",16)} New session</button>`}
   </div>`;
+}
+function deleteSession(id){
+  const s = state.sessions.find(x=>x.id===id); if(!s) return;
+  const shared = Sync.isReady && !isDemoSeed(id);
+  const scope = shared ? "This deletes it for everyone and can't be undone." : "This removes it from this phone only — it can't be undone.";
+  if(!confirm(`Delete "${s.name}"? ${scope}`)) return;
+  state.sessions = state.sessions.filter(x=>x.id!==id);
+  if(shared) Sync.deleteSessionRemote(id);
+  render();
+  toast("Session deleted");
 }
 
 /* ---- ROSTER tab ---- */
@@ -910,7 +982,7 @@ function viewFinish(){
   const modeBanner = offline
     ? `<div style="display:flex;align-items:center;gap:8px;background:#FFF6DB;border:1px solid #F2D77B;color:#6B5300;border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:12.5px;line-height:1.5">
         <span style="width:7px;height:7px;border-radius:99px;background:#F2C13D;flex-shrink:0"></span>
-        Not receiving live starts right now. Search and tap paddlers as they cross — times still record to the millisecond and reconcile once synced.
+        Not receiving live starts right now — the list below shows paddlers this phone already knows are racing. Times record to the millisecond and reconcile once synced.
       </div>`
     : `<div style="display:flex;align-items:center;gap:8px;background:#EAFBF0;border:1px solid #A9E8BE;color:#0F5C2E;border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:12.5px">
         <span style="width:7px;height:7px;border-radius:99px;background:#3FD16B;flex-shrink:0"></span>
@@ -939,18 +1011,18 @@ function viewFinish(){
         <button class="btn-finish" onclick="finishPaddler(${p.id})">${icon("flag",18)} Finish</button>
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-soft);text-align:center;margin-top:8px">started ${fmtClockMs(p.startTs)}</div>
       </div>`).join("")}`
-    : `<div class="empty" style="padding:18px 4px 22px">Nobody showing as on the water yet.${offline?" Use search below to tap paddlers manually.":""}</div>`;
+    : `<div class="empty" style="padding:18px 4px 22px">Nobody on the water yet.<br>Paddlers appear here automatically once the start line starts them.</div>`;
 
-  const fallback = offline ? `
-    <div class="label" style="margin:16px 2px 6px">All paddlers · tap as they cross</div>
-    ${searchBox("qFinish","Find paddler at the buoy…")}
+  const fallback = (offline && onWater.length>6) ? `
+    <div class="label" style="margin:16px 2px 6px">Search paddlers on the water</div>
+    ${searchBox("qFinish","Find a paddler who's racing…")}
     <div class="list" style="margin-top:10px">
-      ${paddlersOf().filter(p=>p.status!=="done" && p.name.toLowerCase().includes(q.toLowerCase())).map(p=>`
+      ${onWater.filter(p=>p.name.toLowerCase().includes(q.toLowerCase())).map(p=>`
         <button class="row" onclick="finishPaddler(${p.id})">
           <div class="sched">${p.sched||"—"}</div>
           <div class="grow"><div class="nm">${esc(p.name)}</div></div>
-          ${chips(p)}
-        </button>`).join("") || `<div class="empty">No matches.</div>`}
+          <div class="wclock" data-run="${p.startTs}" style="font-size:15px">${fmtElapsed(Date.now()-p.startTs)}</div>
+        </button>`).join("") || `<div class="empty">No matches on the water.</div>`}
     </div>` : "";
 
   return `<div class="pad">${modeBanner}${flash}${onWaterHTML}${fallback}</div>`;
@@ -1042,6 +1114,7 @@ function saveEdit(){
   const data={sched:$("#f-sched").value.trim(),name,gender:segVal("f-gender"),team:segVal("f-team"),notes:$("#f-notes").value.trim()};
   if(editId){ Object.assign(byId(editId),data); toast("Saved"); }
   else { paddlersOf().push({id:nid(),status:"queued",startTs:null,finishTs:null,...data}); toast(esc(name)+" added to roster"); }
+  persistSession(currentSession());
   closeSheet(); render();
 }
 function closeSheet(){ $("#sheet-root").innerHTML=""; }
@@ -1053,51 +1126,231 @@ function openImport(){
       <div class="sheet">
         <div class="sheet-h"><div class="sheet-t">Import roster</div>
           <button class="x" onclick="closeSheet()">${icon("x",17)}</button></div>
-        <div style="border:2px dashed var(--line);border-radius:14px;padding:26px 16px;text-align:center;margin-bottom:14px;background:var(--paper)">
-          <div style="color:var(--teal);margin-bottom:8px">${icon("upload",26)}</div>
-          <div style="font-weight:600;font-size:15px;color:var(--ink)">Drop a CSV or choose a file</div>
-          <div style="font-size:12.5px;color:var(--ink-soft);margin-top:4px">Columns: Scheduled time, Name, M/F, Team, Notes</div>
-        </div>
-        <div style="display:flex;align-items:center;gap:10px;background:var(--teal-soft);border-radius:10px;padding:11px 13px;margin-bottom:16px">
-          <div style="font-family:var(--mono);font-size:12.5px;color:var(--teal);flex:1">roster.csv</div>
-          <div style="font-family:var(--cond);font-weight:700;font-size:12px;color:var(--teal);letter-spacing:.08em">24 ROWS</div>
-        </div>
-        <button class="btn-solid" onclick="closeSheet();toast('Roster imported')">Import roster</button>
+        <input type="file" id="csv-file-existing" accept=".csv,text/csv" style="display:none" onchange="handleCsvFileExisting(event)">
+        <button style="all:unset;cursor:pointer;display:block;width:100%" onclick="document.getElementById('csv-file-existing').click()">
+          <div style="border:2px dashed var(--line);border-radius:14px;padding:26px 16px;text-align:center;margin-bottom:14px;background:var(--paper)">
+            <div style="color:var(--teal);margin-bottom:8px">${icon("upload",26)}</div>
+            <div style="font-weight:600;font-size:15px;color:var(--ink)">Tap to choose a CSV file</div>
+            <div style="font-size:12.5px;color:var(--ink-soft);margin-top:4px">Columns: Scheduled time, Name, M/F, Team, Notes</div>
+          </div>
+        </button>
+        <div style="font-size:12px;color:var(--ink-soft);text-align:center">New rows are added to the current roster — existing paddlers aren't touched.</div>
       </div>
     </div>`;
 }
+function handleCsvFileExisting(evt){
+  const file = evt.target.files[0]; evt.target.value=""; if(!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const rows = parseCsv(String(reader.result));
+    if(!rows.length){ toast("No rows found in that file"); return; }
+    const header = rows[0].map(h=>h.trim().toLowerCase());
+    const find = (...keys) => header.findIndex(h=>keys.some(k=>h.includes(k)));
+    const idx = { sched: find("sched","time"), name: find("name"), gender: find("m/f","gender","sex"), team: find("team"), notes: find("note") };
+    if(idx.name===-1){ toast("Couldn't find a Name column in that CSV"); return; }
+    let added=0;
+    rows.slice(1).forEach(cols=>{
+      const name=(cols[idx.name]||"").trim(); if(!name) return;
+      const genderRaw=(idx.gender>-1?cols[idx.gender]:"").trim().toUpperCase();
+      const teamRaw=(idx.team>-1?cols[idx.team]:"").trim();
+      paddlersOf().push({
+        id: nid(), status:"queued", startTs:null, finishTs:null,
+        sched:(idx.sched>-1?cols[idx.sched]:"").trim(), name,
+        gender: genderRaw.startsWith("F")?"F":"M",
+        team: /master/i.test(teamRaw)?"Masters":"Performance",
+        notes:(idx.notes>-1?cols[idx.notes]:"").trim()
+      });
+      added++;
+    });
+    closeSheet();
+    toast(added ? `${added} paddlers imported` : "No usable rows found");
+    persistSession(currentSession());
+    render();
+  };
+  reader.onerror = () => toast("Couldn't read that file");
+  reader.readAsText(file);
+}
 
 /* ---- New Session sheet ---- */
-function openNewSession(){
+let newSessionDraft = null;   // { paddlers:[] } — held until "Create session" is tapped
+function openNewSession(prefill){
   const today = new Date();
   const iso = today.getFullYear()+"-"+pad(today.getMonth()+1)+"-"+pad(today.getDate());
   const suggested = "OC Test "+ fmtDate(iso)+" "+ today.getFullYear();
+  if(!newSessionDraft) newSessionDraft = { paddlers: [] };
+  const name = prefill?.name ?? suggested;
+  const date = prefill?.date ?? iso;
+  const dist = prefill?.dist ?? "330 m";
+  const n = newSessionDraft.paddlers.length;
+  const rosterLabel = n ? `${n} paddler${n===1?"":"s"} added · edit roster` : "Import CSV or add manually";
   $("#sheet-root").innerHTML=`
     <div class="overlay">
-      <div class="scrim" onclick="closeSheet()"></div>
+      <div class="scrim" onclick="cancelNewSession()"></div>
       <div class="sheet">
-        <div class="sheet-h"><div class="sheet-t">New test session</div>
-          <button class="x" onclick="closeSheet()">${icon("x",17)}</button></div>
+        <div class="sheet-h"><div class="sheet-t">New session</div>
+          <button class="x" onclick="cancelNewSession()">${icon("x",17)}</button></div>
         <div class="label" style="margin-bottom:6px">Session name</div>
-        <input class="field" id="ns-name" value="${esc(suggested)}">
+        <input class="field" id="ns-name" value="${esc(name)}">
         <div class="label" style="margin-bottom:6px">Date</div>
-        <input class="field" id="ns-date" type="date" value="${iso}">
+        <input class="field" id="ns-date" type="date" value="${date}">
         <div class="label" style="margin-bottom:6px">Distance</div>
-        <input class="field" id="ns-dist" value="330 m">
+        <input class="field" id="ns-dist" value="${esc(dist)}">
         <div class="label" style="margin-bottom:6px">Roster</div>
-        <button class="btn-ghost" style="width:100%;justify-content:center;margin-bottom:14px" onclick="toast('Would open file picker')">${icon("upload",15)} Import CSV or add manually</button>
+        <button class="btn-ghost" style="width:100%;justify-content:center;margin-bottom:14px" onclick="openNewSessionRoster()">${icon("upload",15)} ${rosterLabel}</button>
         <button class="btn-solid" onclick="createSession()">Create session</button>
         <div style="font-size:12px;color:var(--ink-soft);text-align:center;margin-top:10px;line-height:1.5">You'll set volunteer shifts and run the morning sync next.</div>
       </div>
     </div>`;
 }
+function cancelNewSession(){ newSessionDraft=null; closeSheet(); }
+function captureNewSessionFields(){
+  return { name:$("#ns-name")?.value.trim(), date:$("#ns-date")?.value, dist:$("#ns-dist")?.value.trim() };
+}
+function openNewSessionRoster(){ renderNewSessionRosterSheet(captureNewSessionFields()); }
+function renderNewSessionRosterSheet(fields){
+  window._nsFields = fields;
+  const n = newSessionDraft.paddlers.length;
+  $("#sheet-root").innerHTML=`
+    <div class="overlay">
+      <div class="scrim" onclick="closeNewSessionRoster()"></div>
+      <div class="sheet">
+        <div class="sheet-h"><div class="sheet-t">Roster</div>
+          <button class="x" onclick="closeNewSessionRoster()">${icon("x",17)}</button></div>
+        <input type="file" id="csv-file" accept=".csv,text/csv" style="display:none" onchange="handleCsvFile(event)">
+        <button class="btn-ghost" style="width:100%;justify-content:center;margin-bottom:10px" onclick="document.getElementById('csv-file').click()">${icon("upload",15)} Upload CSV</button>
+        <button class="btn-ghost" style="width:100%;justify-content:center;margin-bottom:14px" onclick="addDraftPaddlerPrompt()">${icon("plus",15)} Add paddler manually</button>
+        <div style="font-size:12px;color:var(--ink-soft);margin-bottom:10px;line-height:1.5">CSV columns: Scheduled time, Name, M/F, Team, Notes — order doesn't matter, headers just need to contain those words.</div>
+        <div class="label" style="margin-bottom:6px">${n} paddler${n===1?"":"s"} added</div>
+        <div class="list" style="max-height:260px;overflow:auto;margin-bottom:14px">${renderDraftRosterList()}</div>
+        <button class="btn-solid" onclick="closeNewSessionRoster()">Done</button>
+      </div>
+    </div>`;
+}
+function renderDraftRosterList(){
+  if(!newSessionDraft.paddlers.length) return `<div class="empty" style="padding:14px 4px">No paddlers yet.</div>`;
+  return newSessionDraft.paddlers.map((p,i)=>`
+    <div class="sess-row" style="cursor:default">
+      <div class="grow">
+        <div class="name">${esc(p.sched||"—")} · ${esc(p.name)}</div>
+        <div class="sub">${p.gender==="F"?"F":"M"} · ${esc(p.team)}</div>
+      </div>
+      <button class="rm" title="remove" onclick="removeDraftPaddler(${i})">${icon("x",15)}</button>
+    </div>`).join("");
+}
+function removeDraftPaddler(i){ newSessionDraft.paddlers.splice(i,1); renderNewSessionRosterSheet(window._nsFields); }
+function closeNewSessionRoster(){ openNewSession(window._nsFields); }
+
+function addDraftPaddlerPrompt(){
+  $("#sheet-root").innerHTML=`
+    <div class="overlay">
+      <div class="scrim" onclick="renderNewSessionRosterSheet(window._nsFields)"></div>
+      <div class="sheet">
+        <div class="sheet-h"><div class="sheet-t">Add paddler</div>
+          <button class="x" onclick="renderNewSessionRosterSheet(window._nsFields)">${icon("x",17)}</button></div>
+        <div class="label" style="margin-bottom:6px">Scheduled time · optional</div>
+        <input class="field" id="dp-sched" placeholder="e.g. 9:15">
+        <div class="label" style="margin-bottom:6px">Name</div>
+        <input class="field" id="dp-name" placeholder="Paddler name">
+        <div class="label" style="margin-bottom:6px">Gender</div>
+        <div class="seg" id="dp-gender">
+          <button class="on" onclick="segSet('dp-gender',this)" data-v="M">M</button>
+          <button onclick="segSet('dp-gender',this)" data-v="F">F</button>
+        </div>
+        <div class="label" style="margin-bottom:6px">Team</div>
+        <div class="seg" id="dp-team">
+          <button class="on" onclick="segSet('dp-team',this)" data-v="Performance">Performance</button>
+          <button onclick="segSet('dp-team',this)" data-v="Masters">Masters</button>
+        </div>
+        <button class="btn-solid" onclick="saveDraftPaddler()">Add to roster</button>
+      </div>
+    </div>`;
+  $("#dp-name").focus();
+}
+function saveDraftPaddler(){
+  const name=$("#dp-name").value.trim(); if(!name){ $("#dp-name").focus(); return; }
+  newSessionDraft.paddlers.push({
+    id: nid(), status:"queued", startTs:null, finishTs:null,
+    sched: $("#dp-sched").value.trim(), name,
+    gender: segVal("dp-gender"), team: segVal("dp-team"), notes:""
+  });
+  toast(esc(name)+" added");
+  renderNewSessionRosterSheet(window._nsFields);
+}
+
+/* -- CSV import: minimal parser handling quoted fields, header matched by keyword -- */
+function parseCsv(text){
+  const rows=[]; let row=[]; let field=""; let inQuotes=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(inQuotes){
+      if(c==='"'){ if(text[i+1]==='"'){ field+='"'; i++; } else inQuotes=false; }
+      else field+=c;
+    } else {
+      if(c==='"') inQuotes=true;
+      else if(c===','){ row.push(field); field=""; }
+      else if(c==="\n" || c==="\r"){
+        if(c==="\r" && text[i+1]==="\n") i++;
+        row.push(field); field=""; rows.push(row); row=[];
+      } else field+=c;
+    }
+  }
+  if(field.length || row.length){ row.push(field); rows.push(row); }
+  return rows.filter(r=>r.some(c=>c.trim()!==""));
+}
+function handleCsvFile(evt){
+  const file = evt.target.files[0]; evt.target.value=""; if(!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const rows = parseCsv(String(reader.result));
+    if(!rows.length){ toast("No rows found in that file"); return; }
+    const header = rows[0].map(h=>h.trim().toLowerCase());
+    const find = (...keys) => header.findIndex(h=>keys.some(k=>h.includes(k)));
+    const idx = { sched: find("sched","time"), name: find("name"), gender: find("m/f","gender","sex"), team: find("team"), notes: find("note") };
+    if(idx.name===-1){ toast("Couldn't find a Name column in that CSV"); return; }
+    let added=0;
+    rows.slice(1).forEach(cols=>{
+      const name=(cols[idx.name]||"").trim(); if(!name) return;
+      const genderRaw=(idx.gender>-1?cols[idx.gender]:"").trim().toUpperCase();
+      const teamRaw=(idx.team>-1?cols[idx.team]:"").trim();
+      newSessionDraft.paddlers.push({
+        id: nid(), status:"queued", startTs:null, finishTs:null,
+        sched:(idx.sched>-1?cols[idx.sched]:"").trim(), name,
+        gender: genderRaw.startsWith("F")?"F":"M",
+        team: /master/i.test(teamRaw)?"Masters":"Performance",
+        notes:(idx.notes>-1?cols[idx.notes]:"").trim()
+      });
+      added++;
+    });
+    toast(added ? `${added} paddlers imported` : "No usable rows found");
+    renderNewSessionRosterSheet(window._nsFields);
+  };
+  reader.onerror = () => toast("Couldn't read that file");
+  reader.readAsText(file);
+}
+
 function createSession(){
   const name=$("#ns-name").value.trim(), date=$("#ns-date").value, dist=$("#ns-dist").value.trim();
-  if(!name) return;
-  // For prototype: just show a toast and close
-  closeSheet();
-  toast("Session created · set shifts next");
-  setTimeout(openShiftsEditor,300);
+  if(!name){ $("#ns-name").focus(); return; }
+  const proceed = () => {
+    const id = "s"+Date.now();
+    const newSess = {
+      id, name, date: date || new Date().toISOString().slice(0,10),
+      distance: dist || "330 m", status:"draft",
+      paddlers: newSessionDraft.paddlers, shifts: {}
+    };
+    state.sessions.unshift(newSess);
+    state.currentSessionId = id;
+    state.reviewSessionId = null;
+    newSessionDraft = null;
+    persistSession(newSess);
+    closeSheet();
+    toast("Session created · set shifts next");
+    setTimeout(openShiftsEditor,300);
+    render();
+  };
+  if(!newSessionDraft.paddlers.length){
+    if(confirm("No paddlers added yet — create the session anyway? You can add paddlers from the Roster tab afterward.")) proceed();
+  } else proceed();
 }
 
 /* ---- Shifts editor sheet ---- */
@@ -1125,7 +1378,7 @@ function openShiftsEditor(){
           <button class="x" onclick="closeSheet()">${icon("x",17)}</button></div>
         <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;line-height:1.5">Each role's schedule. The first entry is who starts; add a shift change to swap crew at a specific time. Shifts show up as inline markers in the roster and start-line queue.</div>
         ${body}
-        <button class="btn-solid" style="margin-top:8px" onclick="closeSheet();toast('Shifts saved')">Save shifts</button>
+        <button class="btn-solid" style="margin-top:8px" onclick="closeSheet();persistSession(currentSession());toast('Shifts saved')">Save shifts</button>
       </div>
     </div>`;
 }
@@ -1135,10 +1388,12 @@ function addShiftPrompt(role){
   const arr = shiftsOf()[role] = shiftsOf()[role] || [];
   arr.push({startsAt:t.trim(), names:names.split(",").map(s=>s.trim()).filter(Boolean)});
   arr.sort((a,b)=>minutesFromSched(a.startsAt)-minutesFromSched(b.startsAt));
+  persistSession(currentSession());
   openShiftsEditor();
 }
 function removeShift(role,i){
   shiftsOf()[role].splice(i,1);
+  persistSession(currentSession());
   openShiftsEditor();
 }
 
@@ -1240,6 +1495,7 @@ setInterval(()=>{
 /* boot: launch overlay is shown; role picker is default */
 updateHeader();
 render();
+bootSessionSync();   // subscribe to the club's shared session library (if Firebase is set up)
 
 /* PWA: register the service worker so the app installs to the home screen
    and runs offline once loaded. Silent no-op when opened as a plain file. */
