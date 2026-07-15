@@ -14,11 +14,10 @@
    the dock, same as before this feature existed.
 */
 window.FIREBASE_CONFIG = {
-  apiKey: "",
-  authDomain: "",
-  databaseURL: "",
-  projectId: "",
-  storageBucket: "",
-  messagingSenderId: "",
-  appId: ""
+  apiKey: "AIzaSyDXwVxHB5Nc_ruJ2Qb0AFbTAsRXX1oxCBw",
+  authDomain: "wv-oc-timer.firebaseapp.com",
+  projectId: "wv-oc-timer",
+  storageBucket: "wv-oc-timer.firebasestorage.app",
+  messagingSenderId: "1019791592692",
+  appId: "1:1019791592692:web:97d36055cdc1468e8c22a1"
 };
