@@ -655,7 +655,7 @@ let liveWatchersStarted=false;
 function startLiveWatchers(){
   if(liveWatchersStarted || !Sync.code) return;
   liveWatchersStarted = true;
-  Sync.onConnectionChange(online=>{ state.liveConnected=online; updateHeader(); });
+  Sync.onConnectionChange(online=>{ state.liveConnected=online; render(); updateHeader(); });
   Sync.watchEvents(events=>{
     const s = currentSession(); if(!s) return;
     let changed=false;
@@ -747,17 +747,24 @@ function demoToggleConn(){
 function exitReview(){ state.reviewSessionId=null; state.tab="session"; render(); updateHeader(); }
 
 /* ================= renderers ================= */
-function render(){ renderBody(); renderNav(); }
+function render(){ renderNav(); renderBody(); }
 
 function renderNav(){
   const onWater = paddlersOf().filter(p=>p.status==="water").length;
-  const tabs=[
+  const allTabs=[
     ["session","cal","Session"],
     ["roster","users","Roster"],
     ["start","play","Start"],
     ["finish","flag","Finish"],
     ["results","list","Results"],
   ];
+  const allowed = {
+    coordinator: ["session","roster","results"],
+    start: ["start","results"],
+    finish: ["finish","results"],
+  }[state.role] || allTabs.map(t=>t[0]);
+  const tabs = allTabs.filter(([key])=>allowed.includes(key));
+  if(!allowed.includes(state.tab)) state.tab = allowed[0];
   $("#nav").innerHTML=tabs.map(([key,ic,lbl])=>`
     <button class="${state.tab===key?"on":""}" onclick="setTab('${key}')">
       ${icon(ic,22,state.tab===key?2.4:2)}
