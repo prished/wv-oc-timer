@@ -285,8 +285,8 @@
   </div>
 
   <div id="review-strip" style="display:none" class="review-strip">
-    <span>Review mode · read-only</span>
-    <button onclick="exitReview()">Back to today</button>
+    <span id="review-strip-label">Review mode · read-only</span>
+    <button id="review-strip-btn" onclick="exitReview()">Back to current</button>
   </div>
 
   <div class="body" id="body"></div>
@@ -369,7 +369,7 @@ function seedFinishedRoster(baseNames, distance){
 const SESSIONS = [
   {
     id:"today",
-    name:"OC Test May 30 2026",
+    name:"Sample · OC Test May 30",
     date:"2026-05-30",
     distance:"330 m",
     status:"draft",           // draft = needs sync ; active = in-progress ; complete = archived
@@ -378,7 +378,7 @@ const SESSIONS = [
   },
   {
     id:"apr18",
-    name:"OC Test Apr 18 2026",
+    name:"Sample · OC Test Apr 18",
     date:"2026-04-18",
     distance:"330 m",
     status:"complete",
@@ -392,7 +392,7 @@ const SESSIONS = [
   },
   {
     id:"mar21",
-    name:"OC Test Mar 21 2026",
+    name:"Sample · OC Test Mar 21",
     date:"2026-03-21",
     distance:"330 m",
     status:"complete",
@@ -417,6 +417,41 @@ const state = {
   lastFinish: null,
   sessionCode: null, liveConnected: false,
 };
+
+/* ---- crash/refresh recovery ----
+   Snapshot the essentials to this phone's local storage so a reload, low
+   battery, or the OS killing a backgrounded tab doesn't lose the session or
+   the role/code needed to rejoin. This is per-phone and works with no data
+   connection — the cloud sync is separate and additive. */
+const LS_KEY = "wv-oc-timer-state-v1";
+let _saveTimer=null;
+function saveLocal(){
+  clearTimeout(_saveTimer);
+  _saveTimer=setTimeout(()=>{
+    try{
+      localStorage.setItem(LS_KEY, JSON.stringify({
+        sessions: state.sessions,
+        currentSessionId: state.currentSessionId,
+        role: state.role, tab: state.tab,
+        sessionCode: state.sessionCode,
+        savedAt: Date.now()
+      }));
+    }catch(e){ /* storage full or blocked — non-fatal */ }
+  }, 300);
+}
+function restoreLocal(){
+  try{
+    const raw = localStorage.getItem(LS_KEY);
+    if(!raw) return false;
+    const d = JSON.parse(raw);
+    if(!d || !Array.isArray(d.sessions)) return false;
+    state.sessions = d.sessions;
+    state.currentSessionId = d.currentSessionId || state.currentSessionId;
+    if(d.role) state.role = d.role;
+    if(d.sessionCode) state.sessionCode = d.sessionCode;
+    return true;
+  }catch(e){ return false; }
+}
 
 /* ================= helpers ================= */
 const $ = (s)=>document.querySelector(s);
@@ -443,10 +478,21 @@ function fmtDateFull(iso){
 }
 
 /* current session helpers */
-function currentSession(){ const id=state.reviewSessionId||state.currentSessionId; return state.sessions.find(s=>s.id===id) || state.sessions[0]; }
+const EMPTY_SESSION = {id:"__none__",name:"No session",date:new Date().toISOString().slice(0,10),distance:"—",status:"draft",paddlers:[],shifts:{}};
+function currentSession(){ const id=state.reviewSessionId||state.currentSessionId; return state.sessions.find(s=>s.id===id) || state.sessions[0] || EMPTY_SESSION; }
 function isReview(){ return !!state.reviewSessionId; }
+/* Editing is locked when reviewing a past session OR when the current session
+   has been marked complete. isReview() stays specifically about archive view
+   so the Session tab's navigation (New session, Past list) still behaves. */
+function isLocked(){ return isReview() || (currentSession() && currentSession().status==="complete"); }
 const paddlersOf = ()=>currentSession().paddlers;
 const shiftsOf = ()=>currentSession().shifts;
+
+/* Single source of truth for "now". When synced, this is the Firebase
+   server-corrected clock, so every phone stamps starts and finishes against
+   the same clock and elapsed times stay accurate to the millisecond even if
+   a phone's own clock drifts. Falls back to local time when not synced. */
+function nowTs(){ try{ return (Sync && Sync.isReady) ? Sync.now() : Date.now(); }catch(e){ return Date.now(); } }
 
 /* ---- shared session library: keep every phone showing the same data ----
    When Firebase is configured, the club's session list lives in the cloud and
@@ -656,15 +702,43 @@ function startLiveWatchers(){
   if(liveWatchersStarted || !Sync.code) return;
   liveWatchersStarted = true;
   Sync.onConnectionChange(online=>{ state.liveConnected=online; render(); updateHeader(); });
+  /* Roster: merge in adds/edits from any phone without clobbering local
+     timing state (status/startTs/finishTs) already applied from events. */
+  Sync.watchRoster(roster=>{
+    const s = currentSession(); if(!s) return;
+    const incoming = Object.values(roster||{}); if(!incoming.length) return;
+    let changed=false;
+    incoming.forEach(rp=>{
+      const existing = s.paddlers.find(x=>x.id===rp.id);
+      if(!existing){
+        s.paddlers.push({status:"queued",startTs:null,finishTs:null,...rp});
+        changed=true;
+      } else {
+        /* update descriptive fields only; preserve live timing fields */
+        ["name","sched","gender","team","notes"].forEach(k=>{
+          if(rp[k]!==undefined && existing[k]!==rp[k]){ existing[k]=rp[k]; changed=true; }
+        });
+      }
+    });
+    if(changed){ render(); }
+  });
   Sync.watchEvents(events=>{
     const s = currentSession(); if(!s) return;
     let changed=false;
-    Object.values(events||{}).forEach(ev=>{
+    const evs = Object.values(events||{});
+    /* Apply start timestamps first, then finishes — order-independent, so a
+       finish recorded offline before its start arrived still resolves. */
+    evs.filter(e=>e.type==="start").forEach(ev=>{
       const p = s.paddlers.find(x=>x.id===ev.paddlerId); if(!p) return;
-      if(ev.type==="start" && p.status==="queued"){ p.status="water"; p.startTs=ev.ts; changed=true; }
-      if(ev.type==="finish" && p.status==="water"){
-        p.status="done"; p.finishTs=ev.ts; changed=true;
-        if(state.role==="finish") state.lastFinish={name:p.name, elapsed:p.finishTs-p.startTs};
+      if(p.startTs!==ev.ts){ p.startTs=ev.ts; changed=true; }
+      if(p.status==="queued"){ p.status="water"; changed=true; }
+    });
+    evs.filter(e=>e.type==="finish").forEach(ev=>{
+      const p = s.paddlers.find(x=>x.id===ev.paddlerId); if(!p) return;
+      if(p.finishTs!==ev.ts){ p.finishTs=ev.ts; changed=true; }
+      if(p.status!=="done"){ p.status="done"; changed=true; }
+      if(state.role==="finish" && changed){
+        state.lastFinish={name:p.name, elapsed:(p.startTs?p.finishTs-p.startTs:null)};
       }
     });
     if(changed){ render(); persistSessionSoon(s); }
@@ -680,26 +754,27 @@ function toast(msg){
 }
 const byId=(id)=>paddlersOf().find(p=>p.id===id);
 
-function armPaddler(id){ if(isReview()) return; state.armed = state.armed===id ? null : id; render(); }
+function armPaddler(id){ if(isLocked()) return; state.armed = state.armed===id ? null : id; render(); }
 function startArmed(){
-  if(isReview()) return;
+  if(isLocked()) return;
   const p=byId(state.armed); if(!p) return;
-  p.status="water"; p.startTs=Date.now(); state.armed=null;
+  p.status="water"; p.startTs=nowTs(); state.armed=null;
   render(); toast("▶ "+esc(p.name)+" started · "+fmtClockMs(p.startTs));
   if(state.sessionCode) Sync.pushStart(p.id, state.role);
   persistSessionSoon(currentSession());
 }
 function finishPaddler(id){
-  if(isReview()) return;
+  if(isLocked()) return;
   const p=byId(id); if(!p) return;
-  p.status="done"; p.finishTs=Date.now();
-  state.lastFinish = {name:p.name, elapsed:p.finishTs-p.startTs};
-  render(); toast("⏱ "+esc(p.name)+" — "+fmtElapsed(p.finishTs-p.startTs));
+  p.status="done"; p.finishTs=nowTs();
+  const elapsed = p.startTs ? p.finishTs-p.startTs : null;
+  state.lastFinish = {name:p.name, elapsed};
+  render(); toast("⏱ "+esc(p.name)+(elapsed!=null?" — "+fmtElapsed(elapsed):" finish recorded"));
   if(state.sessionCode) Sync.pushFinish(p.id, state.role);
   persistSessionSoon(currentSession());
 }
 function cancelRun(id){
-  if(isReview()) return;
+  if(isLocked()) return;
   const p=byId(id); if(!p) return;
   if(!confirm("Cancel "+p.name+"'s start? This discards their recorded time.")) return;
   p.status="queued"; p.startTs=null;
@@ -707,7 +782,7 @@ function cancelRun(id){
   if(state.sessionCode) Sync.pushCancelStart(p.id);
 }
 function redoRun(id){
-  if(isReview()) return;
+  if(isLocked()) return;
   const p=byId(id); if(!p) return;
   if(!confirm(`Reset ${p.name}'s result? Their finish time will be cleared so they can re-run.\n\nReset`)) return;
   p.status="queued"; p.startTs=null; p.finishTs=null;
@@ -732,8 +807,13 @@ function updateHeader(){
     : !live ? "Local only · tap to see why"
     : offline ? "Recording locally · will sync"
     : "Live sync · session " + state.sessionCode;
-  $("#review-strip").style.display = isReview() ? "flex" : "none";
-  $("#sync-tap").style.display = (synced && !isReview()) ? "flex" : "none";
+  $("#review-strip").style.display = isLocked() ? "flex" : "none";
+  if(isLocked()){
+    const lbl=$("#review-strip-label"), btn=$("#review-strip-btn");
+    if(isReview()){ if(lbl) lbl.textContent="Review mode · read-only"; if(btn){ btn.textContent="Back to current"; btn.setAttribute("onclick","exitReview()"); } }
+    else { if(lbl) lbl.textContent="Session complete · read-only"; if(btn){ btn.textContent="Reopen"; btn.setAttribute("onclick","reopenDay()"); } }
+  }
+  $("#sync-tap").style.display = (synced && !isLocked()) ? "flex" : "none";
 }
 function demoToggleConn(){
   if(state.sessionCode){
@@ -747,7 +827,7 @@ function demoToggleConn(){
 function exitReview(){ state.reviewSessionId=null; state.tab="session"; render(); updateHeader(); }
 
 /* ================= renderers ================= */
-function render(){ renderNav(); renderBody(); }
+function render(){ renderNav(); renderBody(); saveLocal(); }
 
 function renderNav(){
   const onWater = paddlersOf().filter(p=>p.status==="water").length;
@@ -843,7 +923,7 @@ function shiftMarkerHTML(group){
   </div>`;
 }
 function paddlerRosterRowHTML(p){
-  const readonly = isReview() ? "" : `onclick="openEdit(${p.id})"`;
+  const readonly = isLocked() ? "" : `onclick="openEdit(${p.id})"`;
   return `<button class="row" ${readonly}>
     <div class="sched">${p.sched||"—"}</div>
     <div class="grow"><div class="nm">${esc(p.name)}</div>${p.notes?`<div class="note">〜 ${esc(p.notes)}</div>`:""}</div>
@@ -866,8 +946,12 @@ function viewSession(){
     : active.status==="draft"
       ? `<button class="btn-ghost" onclick="openHostSyncFromCoordinator()">Run morning sync</button>
          <button class="btn-ghost" onclick="openShiftsEditor()">Volunteer shifts</button>`
-      : `<button class="btn-ghost" onclick="openExport()">${icon("download",14)} Export CSV</button>
-         <button class="btn-ghost" onclick="openShiftsEditor()">Volunteer shifts</button>`;
+      : active.status==="active"
+        ? `<button class="btn-ghost" onclick="openExport()">${icon("download",14)} Export CSV</button>
+           <button class="btn-ghost" onclick="openShiftsEditor()">Volunteer shifts</button>
+           <button class="btn-ghost" onclick="closeDay()">${icon("flag",14)} Finish day</button>`
+        : `<button class="btn-ghost" onclick="openExport()">${icon("download",14)} Export CSV</button>
+           <button class="btn-ghost" onclick="reopenDay()">Reopen session</button>`;
 
   const statusText = isReview()
     ? "Complete · viewing archive"
@@ -911,7 +995,8 @@ function viewSession(){
           <button class="rm" title="Delete session" onclick="event.stopPropagation();deleteSession('${o.id}')">${icon("x",15)}</button>
         </div>`).join("")}
     </div>
-    <button class="btn-solid" onclick="openNewSession()">${icon("plus",16)} New session</button>`}
+    <button class="btn-solid" onclick="openNewSession()">${icon("plus",16)} New session</button>
+    ${state.sessions.some(x=>isDemoSeed(x.id)) ? `<button class="btn-ghost" style="width:100%;justify-content:center;margin-top:10px" onclick="clearSamples()">Clear sample data</button>` : ""}`}
   </div>`;
 }
 function deleteSession(id){
@@ -924,6 +1009,36 @@ function deleteSession(id){
   render();
   toast("Session deleted");
 }
+function clearSamples(){
+  if(!confirm("Remove the built-in sample sessions? This only affects the demo data, not any real sessions you've created.")) return;
+  const wasCurrent = isDemoSeed(state.currentSessionId);
+  state.sessions = state.sessions.filter(x=>!isDemoSeed(x.id));
+  if(!state.sessions.length){
+    state.currentSessionId=null;
+    render(); toast("Sample data cleared"); openNewSession(); return;
+  }
+  if(wasCurrent) state.currentSessionId = state.sessions[0].id;
+  render(); toast("Sample data cleared");
+}
+function closeDay(){
+  const s = currentSession(); if(!s) return;
+  const remaining = s.paddlers.filter(p=>p.status==="water").length;
+  const warn = remaining ? `\n\n${remaining} paddler${remaining===1?" is":"s are"} still on the water — they won't have a finish time.` : "";
+  if(!confirm(`Finish this session and mark it complete?${warn}\n\nYou'll still be able to view and export it, but it becomes read-only.`)) return;
+  s.status = "complete";
+  persistSession(s);
+  render(); updateHeader();
+  toast("Session complete · export when ready");
+  setTimeout(openExport, 350);
+}
+function reopenDay(){
+  const s = currentSession(); if(!s) return;
+  if(!confirm(`Reopen "${s.name}" for editing? It goes back to active so you can record more finishes or fix results.`)) return;
+  s.status = "active";
+  persistSession(s);
+  render(); updateHeader();
+  toast("Session reopened");
+}
 
 /* ---- ROSTER tab ---- */
 function viewRoster(){
@@ -931,7 +1046,7 @@ function viewRoster(){
   const list = paddlersOf().filter(p=>p.name.toLowerCase().includes(q))
     .sort((a,b)=>(minutesFromSched(a.sched)||0)-(minutesFromSched(b.sched)||0));
   const items = interleaveShifts(list);
-  const readonly = isReview();
+  const readonly = isLocked();
   return `<div class="pad">
     ${readonly?"":`<div style="display:flex;gap:8px;margin-bottom:12px">
       <button class="btn-ghost" onclick="openImport()">${icon("upload",15)} Import CSV</button>
@@ -953,7 +1068,7 @@ function viewStart(){
     .sort((a,b)=>(minutesFromSched(a.sched)||0)-(minutesFromSched(b.sched)||0));
   const onWater = paddlersOf().filter(p=>p.status==="water").length;
   const sel = byId(state.armed);
-  const selOk = sel && sel.status==="queued" && !isReview();
+  const selOk = sel && sel.status==="queued" && !isLocked();
   const items = interleaveShifts(queued);
   const rows = items.map(it=>{
     if(it.kind==="shift") return shiftMarkerHTML(it.data);
@@ -975,7 +1090,7 @@ function viewStart(){
     <div class="slabwrap">
       <button class="slab ${selOk?"on":""}" ${selOk?"":"disabled"} onclick="startArmed()">
         <div class="k">${selOk?"Tap to start":"Select a paddler above"}</div>
-        <div style="margin-top:2px"><span class="n">${selOk?esc(sel.name):"—"}</span>${selOk?`<span class="t" id="slab-clock">${fmtClock(Date.now())}</span>`:""}</div>
+        <div style="margin-top:2px"><span class="n">${selOk?esc(sel.name):"—"}</span>${selOk?`<span class="t" id="slab-clock">${fmtClock(nowTs())}</span>`:""}</div>
       </button>
     </div>
   </div>`;
@@ -989,7 +1104,7 @@ function viewFinish(){
   const modeBanner = offline
     ? `<div style="display:flex;align-items:center;gap:8px;background:#FFF6DB;border:1px solid #F2D77B;color:#6B5300;border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:12.5px;line-height:1.5">
         <span style="width:7px;height:7px;border-radius:99px;background:#F2C13D;flex-shrink:0"></span>
-        Not receiving live starts right now — the list below shows paddlers this phone already knows are racing. Times record to the millisecond and reconcile once synced.
+        Not receiving live starts right now. Tap a paddler as they cross — the finish time records to the millisecond and matches to their start once phones reconnect.
       </div>`
     : `<div style="display:flex;align-items:center;gap:8px;background:#EAFBF0;border:1px solid #A9E8BE;color:#0F5C2E;border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:12.5px">
         <span style="width:7px;height:7px;border-radius:99px;background:#3FD16B;flex-shrink:0"></span>
@@ -1001,8 +1116,9 @@ function viewFinish(){
       <div style="font-family:var(--cond);font-size:11px;letter-spacing:.16em;text-transform:uppercase;opacity:.7">Just finished</div>
       <div style="display:flex;align-items:baseline;justify-content:space-between;margin-top:2px">
         <div style="font-family:var(--cond);font-weight:700;font-size:19px">${esc(state.lastFinish.name)}</div>
-        <div style="font-family:var(--mono);font-weight:600;font-size:32px;color:var(--orange)">${fmtElapsed(state.lastFinish.elapsed)}</div>
+        <div style="font-family:var(--mono);font-weight:600;font-size:32px;color:var(--orange)">${state.lastFinish.elapsed!=null?fmtElapsed(state.lastFinish.elapsed):"recorded"}</div>
       </div>
+      ${state.lastFinish.elapsed==null?`<div style="font-size:11.5px;opacity:.7;margin-top:4px">Finish saved — elapsed will fill in once this phone has the start time.</div>`:""}
     </div>` : "";
 
   const onWaterHTML = onWater.length ? `
@@ -1014,30 +1130,57 @@ function viewFinish(){
           <div class="grow" style="font-weight:600;font-size:16px;color:var(--ink)">${esc(p.name)}</div>
           ${chips(p)}
         </div>
-        <div class="wclock" data-run="${p.startTs}">${fmtElapsed(Date.now()-p.startTs)}</div>
+        <div class="wclock" data-run="${p.startTs}">${fmtElapsed(nowTs()-p.startTs)}</div>
         <button class="btn-finish" onclick="finishPaddler(${p.id})">${icon("flag",18)} Finish</button>
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-soft);text-align:center;margin-top:8px">started ${fmtClockMs(p.startTs)}</div>
       </div>`).join("")}`
-    : `<div class="empty" style="padding:18px 4px 22px">Nobody on the water yet.<br>Paddlers appear here automatically once the start line starts them.</div>`;
+    : (offline
+        ? `<div class="empty" style="padding:14px 4px 16px">No live starts are arriving. Find each paddler below as they cross the line.</div>`
+        : `<div class="empty" style="padding:18px 4px 22px">Nobody on the water yet.<br>Paddlers appear here automatically once the start line starts them.</div>`);
 
-  const fallback = (offline && onWater.length>6) ? `
-    <div class="label" style="margin:16px 2px 6px">Search paddlers on the water</div>
-    ${searchBox("qFinish","Find a paddler who's racing…")}
+  /* Offline (or many racers) → searchable roster so finishes are never blocked.
+     Anyone already on the water is shown first for a one-tap finish; everyone
+     else can still be finished, with a confirm to guard against mistaps. */
+  const showRoster = offline || onWater.length>6;
+  const finishable = paddlersOf().filter(p=>p.status!=="done" && p.name.toLowerCase().includes(q.toLowerCase()))
+    .sort((a,b)=>{
+      const aw=a.status==="water"?0:1, bw=b.status==="water"?0:1;
+      if(aw!==bw) return aw-bw;
+      return (minutesFromSched(a.sched)||0)-(minutesFromSched(b.sched)||0);
+    });
+  const fallback = showRoster ? `
+    <div class="label" style="margin:16px 2px 6px">Tap a paddler as they finish</div>
+    ${searchBox("qFinish","Find paddler at the line…")}
     <div class="list" style="margin-top:10px">
-      ${onWater.filter(p=>p.name.toLowerCase().includes(q.toLowerCase())).map(p=>`
-        <button class="row" onclick="finishPaddler(${p.id})">
+      ${finishable.map(p=>{
+        const racing = p.status==="water";
+        return `<button class="row" onclick="${racing?`finishPaddler(${p.id})`:`finishFromRoster(${p.id})`}">
           <div class="sched">${p.sched||"—"}</div>
-          <div class="grow"><div class="nm">${esc(p.name)}</div></div>
-          <div class="wclock" data-run="${p.startTs}" style="font-size:15px">${fmtElapsed(Date.now()-p.startTs)}</div>
-        </button>`).join("") || `<div class="empty">No matches on the water.</div>`}
+          <div class="grow"><div class="nm">${esc(p.name)}</div>${racing?`<div class="sub" style="color:#0F5C2E;font-size:11px">on the water</div>`:""}</div>
+          ${racing?`<div class="wclock" data-run="${p.startTs}" style="font-size:15px">${fmtElapsed(nowTs()-p.startTs)}</div>`:chips(p)}
+        </button>`;
+      }).join("") || `<div class="empty">No matches.</div>`}
     </div>` : "";
 
   return `<div class="pad">${modeBanner}${flash}${onWaterHTML}${fallback}</div>`;
 }
+/* Finish a paddler the finish phone hasn't seen a start for (offline case).
+   Records the finish now; elapsed resolves when the start timestamp arrives. */
+function finishFromRoster(id){
+  if(isLocked()) return;
+  const p=byId(id); if(!p) return;
+  if(!confirm(`Record finish for ${p.name}? Their elapsed time will fill in once this phone has their start.`)) return;
+  p.status="done"; p.finishTs=nowTs();
+  state.lastFinish = {name:p.name, elapsed:(p.startTs?p.finishTs-p.startTs:null)};
+  render(); toast("⏱ "+esc(p.name)+" finish recorded");
+  if(state.sessionCode) Sync.pushFinish(p.id, state.role);
+  persistSessionSoon(currentSession());
+}
 
 /* ---- RESULTS tab ---- */
 function viewResults(){
-  const done = paddlersOf().filter(p=>p.status==="done").sort((a,b)=>(a.finishTs-a.startTs)-(b.finishTs-b.startTs));
+  const el = p => (p.startTs && p.finishTs) ? (p.finishTs-p.startTs) : Infinity;
+  const done = paddlersOf().filter(p=>p.status==="done").sort((a,b)=>el(a)-el(b));
   const f = state.filter;
   const list = done.filter(p => f==="All" ? true : (f==="M"||f==="F") ? p.gender===f : p.team===f);
   return `<div class="pad">
@@ -1049,13 +1192,13 @@ function viewResults(){
       ${list.map((p,i)=>`
         <div class="row" style="cursor:default">
           <div class="rank ${i<3?"top":""}">${i+1}</div>
-          <button class="grow" style="background:none;border:none;text-align:left;padding:0" ${isReview()?"":`onclick="openEdit(${p.id})"`}>
+          <button class="grow" style="background:none;border:none;text-align:left;padding:0" ${isLocked()?"":`onclick="openEdit(${p.id})"`}>
             <div style="display:flex;align-items:center;gap:6px"><span class="nm">${esc(p.name)}</span>${chips(p)}</div>
-            <div class="note">〜 ${p.notes?esc(p.notes):(isReview()?"":"Add a note…")}</div>
+            <div class="note">〜 ${p.notes?esc(p.notes):(isLocked()?"":"Add a note…")}</div>
           </button>
           <div style="text-align:right">
-            <div class="rtime">${fmtElapsed(p.finishTs-p.startTs)}</div>
-            ${isReview()?"":`<button class="rerun" onclick="redoRun(${p.id})">↺ re-run</button>`}
+            <div class="rtime">${(p.startTs&&p.finishTs)?fmtElapsed(p.finishTs-p.startTs):`<span style="font-size:12px;color:var(--ink-soft)">pending start</span>`}</div>
+            ${isLocked()?"":`<button class="rerun" onclick="redoRun(${p.id})">↺ re-run</button>`}
           </div>
         </div>`).join("") || `<div class="empty">No finishes yet.</div>`}
     </div>
@@ -1119,9 +1262,11 @@ function segVal(segId){ return document.querySelector("#"+segId+" button.on").da
 function saveEdit(){
   const name=$("#f-name").value.trim(); if(!name){ $("#f-name").focus(); return; }
   const data={sched:$("#f-sched").value.trim(),name,gender:segVal("f-gender"),team:segVal("f-team"),notes:$("#f-notes").value.trim()};
-  if(editId){ Object.assign(byId(editId),data); toast("Saved"); }
-  else { paddlersOf().push({id:nid(),status:"queued",startTs:null,finishTs:null,...data}); toast(esc(name)+" added to roster"); }
+  let target;
+  if(editId){ target=byId(editId); Object.assign(target,data); toast("Saved"); }
+  else { target={id:nid(),status:"queued",startTs:null,finishTs:null,...data}; paddlersOf().push(target); toast(esc(name)+" added to roster"); }
   persistSession(currentSession());
+  if(state.sessionCode) Sync.pushRosterUpdate(target);
   closeSheet(); render();
 }
 function closeSheet(){ $("#sheet-root").innerHTML=""; }
@@ -1155,23 +1300,25 @@ function handleCsvFileExisting(evt){
     const find = (...keys) => header.findIndex(h=>keys.some(k=>h.includes(k)));
     const idx = { sched: find("sched","time"), name: find("name"), gender: find("m/f","gender","sex"), team: find("team"), notes: find("note") };
     if(idx.name===-1){ toast("Couldn't find a Name column in that CSV"); return; }
-    let added=0;
+    let added=0; const newOnes=[];
     rows.slice(1).forEach(cols=>{
       const name=(cols[idx.name]||"").trim(); if(!name) return;
       const genderRaw=(idx.gender>-1?cols[idx.gender]:"").trim().toUpperCase();
       const teamRaw=(idx.team>-1?cols[idx.team]:"").trim();
-      paddlersOf().push({
+      const rec={
         id: nid(), status:"queued", startTs:null, finishTs:null,
         sched:(idx.sched>-1?cols[idx.sched]:"").trim(), name,
         gender: genderRaw.startsWith("F")?"F":"M",
         team: /master/i.test(teamRaw)?"Masters":"Performance",
         notes:(idx.notes>-1?cols[idx.notes]:"").trim()
-      });
+      };
+      paddlersOf().push(rec); newOnes.push(rec);
       added++;
     });
     closeSheet();
     toast(added ? `${added} paddlers imported` : "No usable rows found");
     persistSession(currentSession());
+    if(state.sessionCode) newOnes.forEach(r=>Sync.pushRosterUpdate(r));
     render();
   };
   reader.onerror = () => toast("Couldn't read that file");
@@ -1489,7 +1636,7 @@ function downloadCSV(){
 
 /* ================= clocks ================= */
 setInterval(()=>{
-  const now=Date.now();
+  const now=nowTs();
   const hdr=$("#hdr-clock"); if(hdr) hdr.textContent=fmtClock(now);
   const sc=$("#sync-clock"); if(sc) sc.textContent=fmtClockMs(now);
   const slab=$("#slab-clock"); if(slab) slab.textContent=fmtClock(now);
@@ -1499,10 +1646,45 @@ setInterval(()=>{
   });
 },43);
 
-/* boot: launch overlay is shown; role picker is default */
+/* boot: restore any saved session/role from this phone first */
+const _restored = restoreLocal();
 updateHeader();
 render();
 bootSessionSync();   // subscribe to the club's shared session library (if Firebase is set up)
+
+/* If we recovered a role from a previous session on this phone, offer a
+   one-tap resume so a mid-day reload doesn't send a volunteer back through
+   role-picking and code-entry. */
+if(_restored && state.role){
+  const roleName = state.role==="coordinator" ? "Coordinator" : state.role==="start" ? "Start line phone" : "Finish line phone";
+  const rb = document.createElement("div");
+  rb.style.cssText = "position:absolute;left:0;right:0;bottom:26px;display:flex;justify-content:center;z-index:5";
+  rb.innerHTML = `<button id="resume-btn" style="background:var(--orange);color:#fff;border:none;border-radius:12px;padding:13px 20px;font-family:var(--cond);font-weight:700;font-size:15px;letter-spacing:.06em;text-transform:uppercase;box-shadow:0 8px 20px rgba(217,30,43,.3)">Resume as ${roleName}${state.sessionCode?` · #${state.sessionCode}`:""}</button>`;
+  const host = $("#launch-role");
+  if(host){
+    host.appendChild(rb);
+    $("#resume-btn").onclick = ()=>{
+      $("#launch-role").style.display="none";
+      if(state.sessionCode){ Sync.init(); Sync.joinSession(state.sessionCode, state.role).then(()=>startLiveWatchers()); }
+      enterApp();
+    };
+  }
+}
+
+/* Keep the screen awake while the app is open — a locked phone at the start
+   line as a paddler launches is exactly the failure this app replaces.
+   Re-acquires after the app returns to the foreground. Silently no-ops on
+   browsers without the API. */
+let _wakeLock=null;
+async function acquireWakeLock(){
+  try{
+    if("wakeLock" in navigator && document.visibilityState==="visible"){
+      _wakeLock = await navigator.wakeLock.request("screen");
+    }
+  }catch(e){ /* denied or unsupported — non-fatal */ }
+}
+document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState==="visible") acquireWakeLock(); });
+acquireWakeLock();
 
 /* PWA: register the service worker so the app installs to the home screen
    and runs offline once loaded. Silent no-op when opened as a plain file. */
